@@ -120,11 +120,24 @@ async function requireHmac(env: Env, req: Request): Promise<Response | null> {
   return json({ error: "Unauthorized" }, 401);
 }
 
-function json(obj: any, status = 200): Response {
-  return new Response(JSON.stringify(obj), {
-    status,
-    headers: { "content-type": "application/json" },
-  });
+function applySecurityHeaders(h: Headers, isHtml = false) {
+  // Core security headers
+  h.set("x-content-type-options", "nosniff");
+  h.set("referrer-policy", "strict-origin-when-cross-origin");
+  h.set("permissions-policy", "camera=(), microphone=(), geolocation=()");
+  // CSP: default to a permissive policy to allow generated content.
+  // You can tighten this later or make it per-tenant configurable.
+  const csp = isHtml
+    ? "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline' blob:; img-src * data: blob:; font-src 'self' data:; connect-src *; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+    : "default-src 'none'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'";
+  h.set("content-security-policy", csp);
+}
+
+function json(obj: any, status = 200, cacheControl?: string): Response {
+  const headers = new Headers({ "content-type": "application/json" });
+  if (cacheControl) headers.set("cache-control", cacheControl);
+  applySecurityHeaders(headers, false);
+  return new Response(JSON.stringify(obj), { status, headers });
 }
 
 function guessContentType(p: string): string {
@@ -149,9 +162,55 @@ function r2Base(tenant: string, slug: string, version: number) {
 }
 
 // ---------- API: POST /api/create ----------
+async function getClientKey(req: Request): Promise<string> {
+  // Use IP if behind CF, else UA+accept as a weak fallback
+  const ip =
+    req.headers.get("cf-connecting-ip") ||
+    req.headers.get("x-forwarded-for") ||
+    "";
+  const ua = req.headers.get("user-agent") || "";
+  return `${ip}|${ua}`;
+}
+
+async function rateLimit(
+  env: Env,
+  req: Request,
+  keyPrefix: string,
+  limit = 60,
+  windowSec = 60,
+): Promise<Response | null> {
+  try {
+    const client = await getClientKey(req);
+    const nowWindow = Math.floor(Date.now() / 1000 / windowSec);
+    const key = `rl:${keyPrefix}:${client}:${nowWindow}`;
+    const currentRaw = await env.PAGES_KV.get(key);
+    const current = currentRaw ? Number(currentRaw) : 0;
+    if (current >= limit) {
+      const headers = new Headers();
+      headers.set("retry-after", String(windowSec));
+      applySecurityHeaders(headers, false);
+      return new Response(JSON.stringify({ error: "Rate limit exceeded" }), {
+        status: 429,
+        headers,
+      });
+    }
+    // increment and set TTL slightly over window
+    await env.PAGES_KV.put(key, String(current + 1), {
+      expirationTtl: windowSec + 5,
+    } as any);
+    return null;
+  } catch {
+    // fail-open on RL errors
+    return null;
+  }
+}
+
 async function handleCreate(env: Env, req: Request) {
   const authErr = await requireHmac(env, req);
   if (authErr) return authErr;
+
+  const rl = await rateLimit(env, req, "create", 60, 60);
+  if (rl) return rl;
 
   const b = (await req.json().catch(() => null)) as any;
   const tenant = String(b?.tenant || "")
@@ -246,6 +305,11 @@ async function handleServe(env: Env, req: Request) {
   const action = url.searchParams.get("action");
   const authErr = await requireHmac(env, req);
   if (authErr) return authErr;
+
+  if (!action) {
+    const rl = await rateLimit(env, req, "serve", 60, 60);
+    if (rl) return rl;
+  }
 
   if (action === "rollback") {
     const b = (await req.json().catch(() => null)) as any;
@@ -359,7 +423,7 @@ async function handleContent(env: Env, req: Request) {
     }
     cursor = list.cursor;
   } while (cursor);
-  return json({ meta, files });
+  return json({ meta, files }, 200, "public, max-age=30");
 }
 
 // ---------- Runtime: GET /p/{tenant}/[[...slug]] ----------
@@ -455,7 +519,7 @@ async function handleRuntime(
     }
   }
 
-  if (!obj) return new Response("Not Found", { status: 404 });
+  if (!obj) return json({ error: "Not Found" }, 404);
 
   const headers = new Headers();
   obj.writeHttpMetadata(headers);
@@ -463,10 +527,18 @@ async function handleRuntime(
     "content-type",
     headers.get("content-type") || guessContentType(pathReq),
   );
-  headers.set("cache-control", `public, max-age=${meta.cacheTTL}`);
+  // HTML gets short TTL; assets respect meta.cacheTTL
+  const isHtml =
+    (headers.get("content-type") || "").includes("text/html") ||
+    pathReq.endsWith("index.html");
+  headers.set(
+    "cache-control",
+    isHtml ? "public, max-age=60" : `public, max-age=${meta.cacheTTL}`,
+  );
   headers.set("x-pages-tenant", meta.tenant);
   headers.set("x-pages-slug", meta.slug);
   headers.set("x-pages-version", String(meta.version));
+  applySecurityHeaders(headers, isHtml);
   return new Response(obj.body, { status: 200, headers });
 }
 
