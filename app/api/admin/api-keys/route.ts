@@ -1,4 +1,10 @@
-import { createApiKey, listApiKeys, revokeApiKey, type ApiKeyRecord } from "@/lib/store";
+import { checkBearerAuthIfConfigured } from "@/app/actions/check-bearer";
+import {
+  createApiKey,
+  listApiKeys,
+  revokeApiKey,
+  type ApiKeyRecord,
+} from "@/lib/store";
 
 export const runtime = "nodejs";
 
@@ -35,24 +41,6 @@ type Err = { ok: false; error: string };
 // Optional bearer auth:
 // - Set ADMIN_BEARER_TOKEN in the environment to require Authorization: Bearer <token>.
 // - If ADMIN_BEARER_TOKEN is unset/empty, this endpoint is open (dev-friendly).
-function checkBearerAuthIfConfigured(request: Request): Response | null {
-  const configured =
-    typeof process !== "undefined" &&
-    !!process.env?.ADMIN_BEARER_TOKEN &&
-    process.env.ADMIN_BEARER_TOKEN.trim().length > 0;
-
-  if (!configured) return null;
-
-  const auth =
-    request.headers.get("authorization") ||
-    request.headers.get("Authorization");
-  const expected = `Bearer ${process.env.ADMIN_BEARER_TOKEN!.trim()}`;
-
-  if (!auth || auth.trim() !== expected) {
-    return json({ ok: false, error: "Unauthorized" }, 401);
-  }
-  return null;
-}
 
 function json(
   data: ListOk | CreateOk | RevokeOk | Err,
@@ -73,7 +61,10 @@ export async function GET(request: Request) {
   const url = new URL(request.url);
   const tenant = (url.searchParams.get("tenant") || "").trim();
   if (!tenant) {
-    return json({ ok: false, error: "Missing required query param: tenant" }, 400);
+    return json(
+      { ok: false, error: "Missing required query param: tenant" },
+      400,
+    );
   }
 
   try {
@@ -157,7 +148,10 @@ export async function DELETE(request: Request) {
   }
 
   if (!id) {
-    return json({ ok: false, error: "id is required (query or JSON body)" }, 400);
+    return json(
+      { ok: false, error: "id is required (query or JSON body)" },
+      400,
+    );
   }
 
   try {
