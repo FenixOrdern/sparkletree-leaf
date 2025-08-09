@@ -229,9 +229,39 @@ async function handleCreate(env: Env, req: Request) {
 
   const version = Date.now();
   const base = r2Base(tenant, slug, version);
-  const body = htmlBase64
-    ? Uint8Array.from(atob(htmlBase64), (c) => c.charCodeAt(0))
-    : te.encode(html!);
+  let htmlText =
+    typeof htmlBase64 === "string"
+      ? new TextDecoder().decode(
+          Uint8Array.from(atob(htmlBase64), (c) => c.charCodeAt(0)),
+        )
+      : (html as string);
+
+  // Normalize absolute asset paths to relative (e.g., /styles.css -> styles.css).
+  // Conservatively rewrites href/src that start with a single leading slash and
+  // do not include a scheme or double slash.
+  if (typeof htmlText === "string" && htmlText.includes("/")) {
+    htmlText = htmlText
+      // href="/..."; href='/...'
+      .replace(/href\s*=\s*"(\/(?!\/|[a-zA-Z]+:)[^"]*)"/g, (_m, p1: string) => {
+        const rel = p1.replace(/^\/+/, "");
+        return `href="${rel}"`;
+      })
+      .replace(/href\s*=\s*'(\/(?!\/|[a-zA-Z]+:)[^']*)'/g, (_m, p1: string) => {
+        const rel = p1.replace(/^\/+/, "");
+        return `href='${rel}'`;
+      })
+      // src="/..."; src='/...'
+      .replace(/src\s*=\s*"(\/(?!\/|[a-zA-Z]+:)[^"]*)"/g, (_m, p1: string) => {
+        const rel = p1.replace(/^\/+/, "");
+        return `src="${rel}"`;
+      })
+      .replace(/src\s*=\s*'(\/(?!\/|[a-zA-Z]+:)[^']*)'/g, (_m, p1: string) => {
+        const rel = p1.replace(/^\/+/, "");
+        return `src='${rel}'`;
+      });
+  }
+
+  const body = te.encode(htmlText);
 
   await env.PAGES_BUCKET.put(base + "index.html", body, {
     httpMetadata: { contentType },
@@ -358,6 +388,49 @@ async function handleServe(env: Env, req: Request) {
   for (const f of files) {
     const p = sanitizeSlug(f.path);
     if (!p) continue;
+
+    // If this is index.html and encoding is utf8 (or unspecified), normalize absolute asset paths.
+    if (
+      p === "index.html" &&
+      (!f.encoding || f.encoding === "utf8") &&
+      typeof f.content === "string" &&
+      f.content.includes("/")
+    ) {
+      let txt = f.content as string;
+      txt = txt
+        // href="/..."; href='/...'
+        .replace(
+          /href\s*=\s*"(\/(?!\/|[a-zA-Z]+:)[^"]*)"/g,
+          (_m, p1: string) => {
+            const rel = p1.replace(/^\/+/, "");
+            return `href="${rel}"`;
+          },
+        )
+        .replace(
+          /href\s*=\s*'(\/(?!\/|[a-zA-Z]+:)[^']*)'/g,
+          (_m, p1: string) => {
+            const rel = p1.replace(/^\/+/, "");
+            return `href='${rel}'`;
+          },
+        )
+        // src="/..."; src='/...'
+        .replace(
+          /src\s*=\s*"(\/(?!\/|[a-zA-Z]+:)[^"]*)"/g,
+          (_m, p1: string) => {
+            const rel = p1.replace(/^\/+/, "");
+            return `src="${rel}"`;
+          },
+        )
+        .replace(
+          /src\s*=\s*'(\/(?!\/|[a-zA-Z]+:)[^']*)'/g,
+          (_m, p1: string) => {
+            const rel = p1.replace(/^\/+/, "");
+            return `src='${rel}'`;
+          },
+        );
+      f.content = txt;
+    }
+
     const content =
       f.encoding === "base64"
         ? Uint8Array.from(atob(f.content), (c) => c.charCodeAt(0))

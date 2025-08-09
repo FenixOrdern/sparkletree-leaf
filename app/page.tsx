@@ -1,9 +1,16 @@
 "use client";
 
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
+import {
+  publishHtmlAction,
+  publishFilesAction,
+  listVersionsAction,
+  rollbackAction,
+  getContentAction,
+} from "@/app/actions/pages";
 
 type PublishResponse = {
   ok: boolean;
@@ -19,6 +26,8 @@ type PublishResponse = {
   };
   error?: string;
 };
+
+type VersionRow = { version: number; objectKey: string };
 
 export default function Page() {
   // Basic form state
@@ -37,9 +46,16 @@ export default function Page() {
   const [lastUrl, setLastUrl] = useState<string | null>(null);
   const [lastPageId, setLastPageId] = useState<string | null>(null);
 
+  // Versions and content state
+  const [versions, setVersions] = useState<VersionRow[]>([]);
+  const [loadingVersions, setLoadingVersions] = useState(false);
+  const [contentJson, setContentJson] = useState<string | null>(null);
+  const [loadingContent, setLoadingContent] = useState(false);
+
   // UX state
   const [creating, setCreating] = useState(false);
   const [serving, setServing] = useState(false);
+  const [rollingBack, setRollingBack] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const pageContentApiLink = useMemo(() => {
@@ -52,26 +68,13 @@ export default function Page() {
     setError(null);
     setCreating(true);
     try {
-      const res = await fetch("/api/create", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          tenant: tenant.trim(),
-          slug: slug.trim() || "index",
-          html,
-          htmlTTL: 60,
-        }),
+      const data = await publishHtmlAction({
+        tenant: tenant.trim(),
+        slug: slug.trim() || "index",
+        html,
+        htmlTTL: 60,
       });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Create failed: ${res.status} ${text}`);
-      }
-      const data: PublishResponse = await res.json();
-      if (!data.ok) {
-        throw new Error(data.error || "Create failed");
-      }
-      setLastUrl(data.url);
+      setLastUrl(data.finalUrl || data.url);
       setLastPageId(data.pageId);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unexpected error in Create");
@@ -107,26 +110,13 @@ export default function Page() {
         });
       }
 
-      const res = await fetch("/api/serve", {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          tenant: tenant.trim(),
-          slug: slug.trim() || "index",
-          files,
-          htmlTTL: 60,
-        }),
+      const data = await publishFilesAction({
+        tenant: tenant.trim(),
+        slug: slug.trim() || "index",
+        files,
+        htmlTTL: 60,
       });
-
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Serve failed: ${res.status} ${text}`);
-      }
-      const data: PublishResponse = await res.json();
-      if (!data.ok) {
-        throw new Error(data.error || "Serve failed");
-      }
-      setLastUrl(data.url);
+      setLastUrl(data.finalUrl || data.url);
       setLastPageId(data.pageId);
     } catch (e) {
       setError(e instanceof Error ? e.message : "Unexpected error in Serve");
@@ -139,19 +129,80 @@ export default function Page() {
     if (lastUrl) window.open(lastUrl, "_blank", "noopener,noreferrer");
   }, [lastUrl]);
 
+  const onLoadVersions = useCallback(async () => {
+    try {
+      setLoadingVersions(true);
+      setError(null);
+      const res = await listVersionsAction({
+        tenant: tenant.trim(),
+        slug: slug.trim() || "index",
+      });
+      setVersions(res.versions || []);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to load versions");
+    } finally {
+      setLoadingVersions(false);
+    }
+  }, [tenant, slug]);
+
+  const onRollback = useCallback(
+    async (version: number) => {
+      try {
+        setRollingBack(version);
+        setError(null);
+        const res = await rollbackAction({
+          tenant: tenant.trim(),
+          slug: slug.trim() || "index",
+          version,
+        });
+        // Update lastUrl to reflect current pointer
+        setLastUrl(res.finalUrl);
+        // Reload versions after rollback
+        onLoadVersions();
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Failed to rollback");
+      } finally {
+        setRollingBack(null);
+      }
+    },
+    [tenant, slug, onLoadVersions],
+  );
+
+  const onViewContent = useCallback(async () => {
+    try {
+      setLoadingContent(true);
+      setError(null);
+      // If we have a last pageId, use that; else compute from tenant/slug and fetch current pointer
+      const pid =
+        lastPageId || `${tenant.trim()}:${(slug.trim() || "index") as string}`;
+      const res = await getContentAction(pid);
+      setContentJson(JSON.stringify(res, null, 2));
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to fetch content");
+    } finally {
+      setLoadingContent(false);
+    }
+  }, [tenant, slug, lastPageId]);
+
+  // Load versions automatically when pageId changes (optional)
+  useEffect(() => {
+    if (lastPageId) {
+      onLoadVersions();
+    }
+  }, [lastPageId, onLoadVersions]);
+
   return (
     <div className="relative flex flex-col min-h-screen items-center w-full p-6 md:p-10">
-      <div className="w-full max-w-4xl flex flex-col gap-6">
+      <div className="w-full max-w-6xl flex flex-col gap-6">
         <header className="flex flex-col gap-2">
           <h1 className="text-2xl font-semibold tracking-tight">
-            AI Pages — Local Publisher
+            SparkleTree Pages — Admin
           </h1>
           <p className="text-sm text-muted-foreground">
-            Publish simple pages locally. Use Create to publish just HTML, or
-            Serve to include multiple files (HTML + CSS).
+            Publish and manage pages via the Cloudflare data plane (signed on
+            the server).
           </p>
         </header>
-
         <section className="grid grid-cols-1 md:grid-cols-3 gap-3">
           <div className="flex flex-col gap-1.5">
             <label className="text-sm font-medium">Tenant</label>
@@ -190,8 +241,7 @@ export default function Page() {
               placeholder="<!doctype html>..."
             />
             <p className="text-xs text-muted-foreground">
-              Tip: When using Serve, you can reference assets/app.css from your
-              HTML.
+              Tip: When using Serve, reference assets/app.css from your HTML.
             </p>
           </div>
           <div className="flex flex-col gap-2">
@@ -258,9 +308,81 @@ export default function Page() {
           {error && <div className="text-sm text-red-600">{error}</div>}
         </section>
 
-        <footer className="pt-4 text-xs text-muted-foreground">
-          This is a local-first implementation. Promote the same API to your
-          edge runtime later without changing the client.
+        {/* Versions & Rollback */}
+        <section className="flex flex-col gap-3 rounded border p-4">
+          <div className="flex items-center justify-between">
+            <h2 className="text-lg font-medium">Versions</h2>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="secondary"
+                onClick={onLoadVersions}
+                disabled={loadingVersions}
+              >
+                {loadingVersions ? "Loading..." : "Load versions"}
+              </Button>
+              <Button
+                variant="secondary"
+                onClick={onViewContent}
+                disabled={loadingContent}
+              >
+                {loadingContent ? "Loading..." : "View content JSON"}
+              </Button>
+            </div>
+          </div>
+          {versions.length === 0 ? (
+            <div className="text-sm text-muted-foreground">
+              No versions to display. Publish something or load versions.
+            </div>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="text-left border-b">
+                    <th className="py-2 pr-4">Version</th>
+                    <th className="py-2 pr-4">Object Key</th>
+                    <th className="py-2 pr-4">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {versions.map((v) => (
+                    <tr key={v.version} className="border-b">
+                      <td className="py-2 pr-4 font-mono">{v.version}</td>
+                      <td className="py-2 pr-4 font-mono break-all">
+                        {v.objectKey}
+                      </td>
+                      <td className="py-2 pr-4">
+                        <Button
+                          size="sm"
+                          variant="secondary"
+                          disabled={rollingBack === v.version}
+                          onClick={() => onRollback(v.version)}
+                        >
+                          {rollingBack === v.version
+                            ? "Rolling back..."
+                            : "Rollback to this"}
+                        </Button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {contentJson && (
+            <div className="mt-3">
+              <label className="text-sm font-medium">
+                Content JSON (current pageId or tenant:slug)
+              </label>
+              <pre className="mt-2 max-h-64 overflow-auto text-xs bg-muted p-3 rounded">
+                {contentJson}
+              </pre>
+            </div>
+          )}
+        </section>
+
+        <footer className="pt-2 text-xs text-muted-foreground">
+          All server calls are HMAC-signed on the server and published to the
+          Cloudflare data plane. Enjoy instant, versioned edge pages.
         </footer>
       </div>
     </div>
