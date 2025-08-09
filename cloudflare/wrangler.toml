@@ -1,0 +1,24 @@
+name = "ai-pages-worker"
+main = "src/worker.ts"
+compatibility_date = "2024-06-20"
+compatibility_flags = ["nodejs_compat"]
+
+# Bindings: set your actual IDs via Wrangler/Terraform then update here
+# After provisioning: wrangler kv namespace create pages_kv, wrangler r2 bucket create pages
+[[kv_namespaces]]
+binding = "PAGES_KV"
+id = "b5b4f0fa48794951b3f656e765470f8a"
+
+[[r2_buckets]]
+binding = "PAGES_BUCKET"
+bucket_name = "pages"
+
+[vars]
+# Optional security
+#PAGES_HMAC_SECRET = " "
+#ADMIN_BEARER_TOKEN = " "
+
+# Routes (configure via wrangler routes)
+routes = [
+  { pattern = "pages.sparkletree.io/*", zone_name = "sparkletree.io" }
+]
