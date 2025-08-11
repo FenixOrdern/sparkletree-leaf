@@ -20,6 +20,7 @@ type PageMeta = {
   publishedAt: string;
   tenant: string;
   slug: string;
+  ownerKeyId?: string;
 };
 
 // ---------- helpers ----------
@@ -120,6 +121,71 @@ async function requireHmac(env: Env, req: Request): Promise<Response | null> {
   return json({ error: "Unauthorized" }, 401);
 }
 
+type AuthContext = { isAdmin: boolean; keyId?: string };
+
+async function keyIdFromSecret(secret: string): Promise<string> {
+  return await sha256Hex("k:" + secret);
+}
+
+function getAdminToken(env: Env): string | undefined {
+  return env.ADMIN_BEARER_TOKEN || undefined;
+}
+
+function getAuthzHeader(req: Request): string | null {
+  return req.headers.get("authorization") || req.headers.get("Authorization");
+}
+
+async function getAuthContext(
+  env: Env,
+  req: Request,
+): Promise<AuthContext | Response> {
+  // Admin bearer token
+  const admin = getAdminToken(env);
+  const authz = getAuthzHeader(req);
+  if (admin && authz === `Bearer ${admin}`) {
+    return { isAdmin: true };
+  }
+
+  // HMAC identity
+  const secrets = getSecrets(env);
+  if (secrets.length === 0) {
+    // Not enforced; identity unknown
+    return { isAdmin: false };
+  }
+
+  const sig = parseSig(req.headers.get("x-pages-signature"));
+  const ts = req.headers.get("x-pages-timestamp");
+  if (!sig || !ts || !/^\d{10,16}$/.test(ts)) {
+    return json({ error: "Unauthorized" }, 401);
+  }
+  const now = Date.now();
+  const skew = Math.abs(now - Number(ts));
+  if (!Number.isFinite(Number(ts)) || skew > 5 * 60_000) {
+    return json({ error: "Unauthorized (timestamp)" }, 401);
+  }
+  const url = new URL(req.url);
+  const bodyText = await req.clone().text();
+  const bodyHash = await sha256Hex(bodyText);
+  const canon = canonString(
+    req.method,
+    url.pathname + url.search,
+    ts,
+    bodyHash,
+  );
+  for (const s of secrets) {
+    const expected = await hmacHex(s, canon);
+    if (tscmp(sig, expected)) {
+      const keyId = await keyIdFromSecret(s);
+      return { isAdmin: false, keyId };
+    }
+  }
+  return json({ error: "Unauthorized" }, 401);
+}
+
+function forbidden(): Response {
+  return json({ error: "Forbidden" }, 403);
+}
+
 function applySecurityHeaders(h: Headers, isHtml = false) {
   // Core security headers
   h.set("x-content-type-options", "nosniff");
@@ -151,6 +217,36 @@ function guessContentType(p: string): string {
   if (lower.endsWith(".jpg") || lower.endsWith(".jpeg")) return "image/jpeg";
   if (lower.endsWith(".gif")) return "image/gif";
   return "application/octet-stream";
+}
+
+/**
+ * Sanitize incoming content-type values:
+ * - Trim and fix common typos like "text /html" -> "text/html"
+ * - Ensure charset for text/html
+ * - Fallback to guessed type when invalid or missing
+ */
+function sanitizeContentType(input: string | undefined, path: string): string {
+  const fallback = guessContentType(path);
+  if (!input || typeof input !== "string") return fallback;
+
+  // Normalize: trim, collapse spaces, remove spaces around slash in type/subtype
+  let ct = input.trim();
+  ct = ct.replace(/\s*\/\s*/, "/").replace(/\s{2,}/g, " ");
+
+  // Ensure text/html always has a charset
+  if (/^text\/html/i.test(ct)) {
+    if (!/;\s*charset=/i.test(ct)) {
+      return "text/html; charset=utf-8";
+    }
+    return ct;
+  }
+
+  // Very loose validation of media type; if it fails, use fallback
+  const valid =
+    /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+(?:\s*;\s*[\w-]+=[^;]+)?$/i.test(
+      ct,
+    );
+  return valid ? ct : fallback;
 }
 
 // KV keys: pages:{tenant}:{slug}
@@ -206,8 +302,9 @@ async function rateLimit(
 }
 
 async function handleCreate(env: Env, req: Request) {
-  const authErr = await requireHmac(env, req);
-  if (authErr) return authErr;
+  // Auth with identity (admin bearer or HMAC)
+  const auth = await getAuthContext(env, req);
+  if (auth instanceof Response) return auth;
 
   const rl = await rateLimit(env, req, "create", 60, 60);
   if (rl) return rl;
@@ -219,22 +316,38 @@ async function handleCreate(env: Env, req: Request) {
   const slug = sanitizeSlug(String(b?.slug || "index").trim());
   const html = typeof b?.html === "string" ? b.html : null;
   const htmlBase64 = typeof b?.htmlBase64 === "string" ? b.htmlBase64 : null;
-  const contentType =
-    typeof b?.contentType === "string"
-      ? b.contentType
-      : "text/html; charset=utf-8";
+  const contentTypeRaw =
+    typeof b?.contentType === "string" ? b.contentType : undefined;
+  const contentType = sanitizeContentType(contentTypeRaw, "index.html");
   const ttl = typeof b?.htmlTTL === "number" ? b.htmlTTL : 60;
   if (!tenant || (!html && !htmlBase64))
     return json({ error: "tenant and (html|htmlBase64) required" }, 400);
 
+  // Enforce ownership if slug exists
+  const existingRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
+  const existing = existingRaw
+    ? (JSON.parse(existingRaw) as PageMeta)
+    : undefined;
+  if (existing?.ownerKeyId && !auth.isAdmin) {
+    if (!auth.keyId || auth.keyId !== existing.ownerKeyId) return forbidden();
+  }
+
   const version = Date.now();
   const base = r2Base(tenant, slug, version);
-  let htmlText =
-    typeof htmlBase64 === "string"
-      ? new TextDecoder().decode(
-          Uint8Array.from(atob(htmlBase64), (c) => c.charCodeAt(0)),
-        )
-      : (html as string);
+  let htmlText: string;
+  if (typeof htmlBase64 === "string") {
+    try {
+      const bytes = Uint8Array.from(atob(htmlBase64), (c) => c.charCodeAt(0));
+      htmlText = new TextDecoder().decode(bytes);
+    } catch (e) {
+      return json(
+        { error: "Invalid base64 htmlBase64", details: String(e) },
+        400,
+      );
+    }
+  } else {
+    htmlText = html as string;
+  }
 
   // Normalize absolute asset paths to relative (e.g., /styles.css -> styles.css).
   // Conservatively rewrites href/src that start with a single leading slash and
@@ -262,10 +375,24 @@ async function handleCreate(env: Env, req: Request) {
   }
 
   const body = te.encode(htmlText);
+  const ownerKeyId =
+    existing?.ownerKeyId ?? (auth.isAdmin ? undefined : auth.keyId);
 
-  await env.PAGES_BUCKET.put(base + "index.html", body, {
-    httpMetadata: { contentType },
-  });
+  try {
+    await env.PAGES_BUCKET.put(base + "index.html", body, {
+      httpMetadata: { contentType },
+      customMetadata: ownerKeyId ? { ownerKeyId } : undefined,
+    });
+  } catch (err) {
+    return json(
+      {
+        error: "R2 put failed",
+        path: base + "index.html",
+        details: String(err),
+      },
+      400,
+    );
+  }
   const meta: PageMeta = {
     objectKey: base,
     version,
@@ -274,6 +401,7 @@ async function handleCreate(env: Env, req: Request) {
     publishedAt: new Date().toISOString(),
     tenant,
     slug,
+    ownerKeyId,
   };
   await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(meta));
   return json({
@@ -333,8 +461,8 @@ async function handleServe(env: Env, req: Request) {
   }
 
   const action = url.searchParams.get("action");
-  const authErr = await requireHmac(env, req);
-  if (authErr) return authErr;
+  const auth = await getAuthContext(env, req);
+  if (auth instanceof Response) return auth;
 
   if (!action) {
     const rl = await rateLimit(env, req, "serve", 60, 60);
@@ -342,6 +470,8 @@ async function handleServe(env: Env, req: Request) {
   }
 
   if (action === "rollback") {
+    // Using previously obtained auth
+
     const b = (await req.json().catch(() => null)) as any;
     const tenant = String(b?.tenant || "")
       .trim()
@@ -354,9 +484,16 @@ async function handleServe(env: Env, req: Request) {
     // Verify the version exists
     const exists = await env.PAGES_BUCKET.head(objectKey + "index.html");
     if (!exists) return json({ error: "Version not found" }, 404);
-    const currMeta: PageMeta = JSON.parse(
-      (await env.PAGES_KV.get(kvKey(tenant, slug))) || "{}",
-    );
+
+    const currMetaRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
+    const currMeta: PageMeta = currMetaRaw
+      ? JSON.parse(currMetaRaw)
+      : ({} as any);
+    // Enforce ownership
+    if (currMeta?.ownerKeyId && !auth.isAdmin) {
+      if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId) return forbidden();
+    }
+
     const meta: PageMeta = {
       ...(currMeta || {
         cacheTTL: 60,
@@ -367,9 +504,121 @@ async function handleServe(env: Env, req: Request) {
       objectKey,
       version,
       publishedAt: new Date().toISOString(),
+      ownerKeyId: currMeta?.ownerKeyId,
     };
     await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(meta));
     return json({ ok: true, pageId: `${tenant}:${slug}:${version}`, meta });
+  }
+
+  // Delete page or specific version
+  if (action === "delete") {
+    const b = (await req.json().catch(() => null)) as any;
+    const tenant = String(b?.tenant || "")
+      .trim()
+      .toLowerCase();
+    const slug = sanitizeSlug(String(b?.slug || "").trim());
+    const version =
+      b?.version !== undefined && b?.version !== null
+        ? Number(b.version)
+        : undefined;
+
+    if (!tenant || !slug)
+      return json({ error: "tenant and slug required" }, 400);
+
+    const currRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
+    const currMeta: PageMeta | null = currRaw ? JSON.parse(currRaw) : null;
+
+    // Ownership enforcement
+    if (currMeta?.ownerKeyId && !auth.isAdmin) {
+      if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId) {
+        if (version) {
+          const head = await env.PAGES_BUCKET.head(
+            r2Base(tenant, slug, version) + "index.html",
+          );
+          const r2Owner = (head?.customMetadata as any)?.ownerKeyId;
+          if (!r2Owner || r2Owner !== auth.keyId) return forbidden();
+        } else {
+          return forbidden();
+        }
+      }
+    } else if (!currMeta && !auth.isAdmin) {
+      if (version) {
+        const head = await env.PAGES_BUCKET.head(
+          r2Base(tenant, slug, version) + "index.html",
+        );
+        const r2Owner = (head?.customMetadata as any)?.ownerKeyId;
+        if (!r2Owner || r2Owner !== auth.keyId) return forbidden();
+      } else {
+        return forbidden();
+      }
+    }
+
+    if (version) {
+      const base = r2Base(tenant, slug, version);
+      // Delete all objects under this version
+      let cursor: string | undefined = undefined;
+      do {
+        const list = await env.PAGES_BUCKET.list({ prefix: base, cursor });
+        if (list.objects.length) {
+          await env.PAGES_BUCKET.delete(list.objects.map((o) => o.key));
+        }
+        cursor = list.cursor;
+      } while (cursor);
+
+      // If current pointer equals this version, repoint or remove
+      if (currMeta && currMeta.version === version) {
+        const prefix = `pages/${tenant}/${slug}/`;
+        const versions = new Set<number>();
+        let c2: string | undefined = undefined;
+        do {
+          const list = await env.PAGES_BUCKET.list({ prefix, cursor: c2 });
+          for (const obj of list.objects) {
+            const parts = obj.key.split("/");
+            if (parts.length >= 5) {
+              const v = Number(parts[3]);
+              if (!Number.isNaN(v)) versions.add(v);
+            }
+          }
+          c2 = list.cursor;
+        } while (c2);
+        versions.delete(version);
+
+        if (versions.size === 0) {
+          await env.PAGES_KV.delete(kvKey(tenant, slug));
+        } else {
+          const newVersion = Math.max(...Array.from(versions));
+          const newObjectKey = r2Base(tenant, slug, newVersion);
+          const newMeta: PageMeta = {
+            ...(currMeta || {
+              cacheTTL: 60,
+              headers: { "content-type": "text/html; charset=utf-8" },
+              tenant,
+              slug,
+            }),
+            objectKey: newObjectKey,
+            version: newVersion,
+            publishedAt: new Date().toISOString(),
+            ownerKeyId: currMeta?.ownerKeyId,
+          };
+          await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(newMeta));
+        }
+      }
+
+      return json({ ok: true, deleted: { tenant, slug, version } });
+    } else {
+      // Delete all versions and KV pointer
+      const prefix = `pages/${tenant}/${slug}/`;
+      let cursor: string | undefined = undefined;
+      do {
+        const list = await env.PAGES_BUCKET.list({ prefix, cursor });
+        if (list.objects.length) {
+          await env.PAGES_BUCKET.delete(list.objects.map((o) => o.key));
+        }
+        cursor = list.cursor;
+      } while (cursor);
+      await env.PAGES_KV.delete(kvKey(tenant, slug));
+      return json({ ok: true, deleted: { tenant, slug } });
+    }
   }
 
   // Default: publish files
@@ -383,8 +632,22 @@ async function handleServe(env: Env, req: Request) {
   if (!tenant || files.length === 0)
     return json({ error: "tenant and files required" }, 400);
 
+  // Auth with identity and ownership check (already performed above)
+
+  const currentRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
+  const currentMeta: PageMeta | null = currentRaw
+    ? JSON.parse(currentRaw)
+    : null;
+  if (currentMeta?.ownerKeyId && !auth.isAdmin) {
+    if (!auth.keyId || auth.keyId !== currentMeta.ownerKeyId)
+      return forbidden();
+  }
+
   const version = Date.now();
   const base = r2Base(tenant, slug, version);
+  const ownerKeyId =
+    currentMeta?.ownerKeyId ?? (auth.isAdmin ? undefined : auth.keyId);
+
   for (const f of files) {
     const p = sanitizeSlug(f.path);
     if (!p) continue;
@@ -431,13 +694,36 @@ async function handleServe(env: Env, req: Request) {
       f.content = txt;
     }
 
-    const content =
-      f.encoding === "base64"
-        ? Uint8Array.from(atob(f.content), (c) => c.charCodeAt(0))
-        : te.encode(f.content);
-    await env.PAGES_BUCKET.put(base + p, content, {
-      httpMetadata: { contentType: f.contentType },
-    });
+    let content: Uint8Array;
+    if (f.encoding === "base64") {
+      try {
+        content = Uint8Array.from(atob(f.content), (c) => c.charCodeAt(0));
+      } catch (e) {
+        return json(
+          { error: "Invalid base64 content", path: p, details: String(e) },
+          400,
+        );
+      }
+    } else {
+      content = te.encode(f.content);
+    }
+    const ct = sanitizeContentType(f.contentType, p);
+    try {
+      await env.PAGES_BUCKET.put(base + p, content, {
+        httpMetadata: { contentType: ct },
+        customMetadata: ownerKeyId ? { ownerKeyId } : undefined,
+      });
+    } catch (err) {
+      return json(
+        {
+          error: "R2 put failed",
+          path: base + p,
+          contentType: ct,
+          details: String(err),
+        },
+        400,
+      );
+    }
   }
   const meta: PageMeta = {
     objectKey: base,
@@ -447,6 +733,7 @@ async function handleServe(env: Env, req: Request) {
     publishedAt: new Date().toISOString(),
     tenant,
     slug,
+    ownerKeyId,
   };
   await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(meta));
   return json({
