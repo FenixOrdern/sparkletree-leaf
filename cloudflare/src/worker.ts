@@ -21,6 +21,7 @@ type PageMeta = {
   tenant: string;
   slug: string;
   ownerKeyId?: string;
+  ownerClientId?: string;
   deleteAfterSeconds?: number;
   autoDeleteAt?: string;
 };
@@ -339,19 +340,44 @@ async function rateLimit(
   }
 }
 
+async function preventReplay(
+  env: Env,
+  scopeKey: string,
+  ttlSec = 600,
+): Promise<Response | null> {
+  try {
+    const v = await env.PAGES_KV.get(scopeKey);
+    if (v) return json({ error: "Replay detected" }, 409);
+    await env.PAGES_KV.put(scopeKey, "1", { expirationTtl: ttlSec } as any);
+    return null;
+  } catch {
+    // Fail-open on KV errors to avoid false positives blocking traffic.
+    return null;
+  }
+}
+
 async function handleCreate(env: Env, req: Request) {
   // Auth with identity (admin bearer or HMAC)
   const auth = await getAuthContext(env, req);
   if (auth instanceof Response) return auth;
-
-  const rl = await rateLimit(env, req, "create", 60, 60);
-  if (rl) return rl;
 
   const b = (await req.json().catch(() => null)) as any;
   const tenant = String(b?.tenant || "")
     .trim()
     .toLowerCase();
   const slug = sanitizeSlug(String(b?.slug || "index").trim());
+  const sub = typeof b?.sub === "string" ? b.sub : "";
+  const role = typeof b?.role === "string" ? b.role : "";
+  const clientId = typeof b?.clientId === "string" ? b.clientId : "";
+  const jti = typeof b?.jti === "string" ? b.jti : "";
+  if (!jti) return json({ error: "jti required" }, 400);
+  const pr = await preventReplay(
+    env,
+    `rp:${clientId || auth.keyId || "unknown"}:${jti}`,
+  );
+  if (pr) return pr;
+  const rl = await rateLimit(env, req, `create:${tenant}`, 60, 60);
+  if (rl) return rl;
   const html = typeof b?.html === "string" ? b.html : null;
   const htmlBase64 = typeof b?.htmlBase64 === "string" ? b.htmlBase64 : null;
   const contentTypeRaw =
@@ -367,8 +393,12 @@ async function handleCreate(env: Env, req: Request) {
   const existing = existingRaw
     ? (JSON.parse(existingRaw) as PageMeta)
     : undefined;
-  if (existing?.ownerKeyId && !auth.isAdmin) {
-    if (!auth.keyId || auth.keyId !== existing.ownerKeyId) return forbidden();
+  if (!auth.isAdmin) {
+    if (existing?.ownerClientId) {
+      if (!clientId || clientId !== existing.ownerClientId) return forbidden();
+    } else if (existing?.ownerKeyId) {
+      if (!auth.keyId || auth.keyId !== existing.ownerKeyId) return forbidden();
+    }
   }
 
   const version = Date.now();
@@ -416,11 +446,17 @@ async function handleCreate(env: Env, req: Request) {
   const body = te.encode(htmlText);
   const ownerKeyId =
     existing?.ownerKeyId ?? (auth.isAdmin ? undefined : auth.keyId);
+  const ownerClientId =
+    existing?.ownerClientId ??
+    (auth.isAdmin ? undefined : clientId || undefined);
 
   try {
+    const customMeta: Record<string, string> = {};
+    if (ownerKeyId) customMeta.ownerKeyId = ownerKeyId;
+    if (ownerClientId) customMeta.ownerClientId = ownerClientId;
     await env.PAGES_BUCKET.put(base + "index.html", body, {
       httpMetadata: { contentType },
-      customMetadata: ownerKeyId ? { ownerKeyId } : undefined,
+      customMetadata: Object.keys(customMeta).length ? customMeta : undefined,
     });
   } catch (err) {
     return json(
@@ -441,6 +477,7 @@ async function handleCreate(env: Env, req: Request) {
     tenant,
     slug,
     ownerKeyId,
+    ownerClientId,
     deleteAfterSeconds,
     autoDeleteAt: computeAutoDeleteAt(version, deleteAfterSeconds),
   };
@@ -528,6 +565,18 @@ async function handleServe(env: Env, req: Request) {
       .toLowerCase();
     const slug = sanitizeSlug(String(b?.slug || "").trim());
     const version = Number(b?.version);
+    const sub = typeof b?.sub === "string" ? b.sub : "";
+    const role = typeof b?.role === "string" ? b.role : "";
+    const clientId = typeof b?.clientId === "string" ? b.clientId : "";
+    const jti = typeof b?.jti === "string" ? b.jti : "";
+    if (!jti) return json({ error: "jti required" }, 400);
+    const pr = await preventReplay(
+      env,
+      `rp:${clientId || auth.keyId || "unknown"}:${jti}`,
+    );
+    if (pr) return pr;
+    const rlRb = await rateLimit(env, req, `serve:rollback:${tenant}`, 60, 60);
+    if (rlRb) return rlRb;
     if (!tenant || !slug || !Number.isFinite(version))
       return json({ error: "tenant, slug, version required" }, 400);
     const objectKey = r2Base(tenant, slug, version);
@@ -544,8 +593,14 @@ async function handleServe(env: Env, req: Request) {
       return json({ error: "Gone" }, 410);
     }
     // Enforce ownership
-    if (currMeta?.ownerKeyId && !auth.isAdmin) {
-      if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId) return forbidden();
+    if (!auth.isAdmin) {
+      if (currMeta?.ownerClientId) {
+        if (!clientId || clientId !== currMeta.ownerClientId)
+          return forbidden();
+      } else if (currMeta?.ownerKeyId) {
+        if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId)
+          return forbidden();
+      }
     }
 
     const meta: PageMeta = {
@@ -559,6 +614,7 @@ async function handleServe(env: Env, req: Request) {
       version,
       publishedAt: new Date().toISOString(),
       ownerKeyId: currMeta?.ownerKeyId,
+      ownerClientId: currMeta?.ownerClientId,
     };
     await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(meta));
     return json({ ok: true, pageId: `${tenant}:${slug}:${version}`, meta });
@@ -575,6 +631,18 @@ async function handleServe(env: Env, req: Request) {
       b?.version !== undefined && b?.version !== null
         ? Number(b.version)
         : undefined;
+    const sub = typeof b?.sub === "string" ? b.sub : "";
+    const role = typeof b?.role === "string" ? b.role : "";
+    const clientId = typeof b?.clientId === "string" ? b.clientId : "";
+    const jti = typeof b?.jti === "string" ? b.jti : "";
+    if (!jti) return json({ error: "jti required" }, 400);
+    const pr = await preventReplay(
+      env,
+      `rp:${clientId || auth.keyId || "unknown"}:${jti}`,
+    );
+    if (pr) return pr;
+    const rlDel = await rateLimit(env, req, `serve:delete:${tenant}`, 60, 60);
+    if (rlDel) return rlDel;
 
     if (!tenant || !slug)
       return json({ error: "tenant and slug required" }, 400);
@@ -582,28 +650,45 @@ async function handleServe(env: Env, req: Request) {
     const currRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
     const currMeta: PageMeta | null = currRaw ? JSON.parse(currRaw) : null;
 
-    // Ownership enforcement
-    if (currMeta?.ownerKeyId && !auth.isAdmin) {
-      if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId) {
+    // Ownership enforcement with clientId first, fallback to keyId
+    if (!auth.isAdmin) {
+      if (currMeta?.ownerClientId) {
+        if (!clientId || clientId !== currMeta.ownerClientId) {
+          return forbidden();
+        }
+      } else if (currMeta?.ownerKeyId) {
+        if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId) {
+          if (version) {
+            const head = await env.PAGES_BUCKET.head(
+              r2Base(tenant, slug, version) + "index.html",
+            );
+            const r2OwnerKey = (head?.customMetadata as any)?.ownerKeyId;
+            if (!r2OwnerKey || r2OwnerKey !== auth.keyId) return forbidden();
+          } else {
+            return forbidden();
+          }
+        }
+      } else if (!currMeta) {
         if (version) {
           const head = await env.PAGES_BUCKET.head(
             r2Base(tenant, slug, version) + "index.html",
           );
-          const r2Owner = (head?.customMetadata as any)?.ownerKeyId;
-          if (!r2Owner || r2Owner !== auth.keyId) return forbidden();
+          const r2OwnerClient = (head?.customMetadata as any)?.ownerClientId;
+          const r2OwnerKey = (head?.customMetadata as any)?.ownerKeyId;
+          const okClient = !!(
+            r2OwnerClient &&
+            clientId &&
+            r2OwnerClient === clientId
+          );
+          const okKey = !!(
+            r2OwnerKey &&
+            auth.keyId &&
+            r2OwnerKey === auth.keyId
+          );
+          if (!okClient && !okKey) return forbidden();
         } else {
           return forbidden();
         }
-      }
-    } else if (!currMeta && !auth.isAdmin) {
-      if (version) {
-        const head = await env.PAGES_BUCKET.head(
-          r2Base(tenant, slug, version) + "index.html",
-        );
-        const r2Owner = (head?.customMetadata as any)?.ownerKeyId;
-        if (!r2Owner || r2Owner !== auth.keyId) return forbidden();
-      } else {
-        return forbidden();
       }
     }
 
@@ -683,6 +768,18 @@ async function handleServe(env: Env, req: Request) {
   const slug = sanitizeSlug(String(b?.slug || "index").trim());
   const files = Array.isArray(b?.files) ? (b.files as FileRecord[]) : [];
   const ttl = typeof b?.htmlTTL === "number" ? b.htmlTTL : 60;
+  const sub = typeof b?.sub === "string" ? b.sub : "";
+  const role = typeof b?.role === "string" ? b.role : "";
+  const clientId = typeof b?.clientId === "string" ? b.clientId : "";
+  const jti = typeof b?.jti === "string" ? b.jti : "";
+  if (!jti) return json({ error: "jti required" }, 400);
+  const pr = await preventReplay(
+    env,
+    `rp:${clientId || auth.keyId || "unknown"}:${jti}`,
+  );
+  if (pr) return pr;
+  const rlPub = await rateLimit(env, req, `serve:publish:${tenant}`, 60, 60);
+  if (rlPub) return rlPub;
   if (!tenant || files.length === 0)
     return json({ error: "tenant and files required" }, 400);
 
@@ -692,15 +789,23 @@ async function handleServe(env: Env, req: Request) {
   const currentMeta: PageMeta | null = currentRaw
     ? JSON.parse(currentRaw)
     : null;
-  if (currentMeta?.ownerKeyId && !auth.isAdmin) {
-    if (!auth.keyId || auth.keyId !== currentMeta.ownerKeyId)
-      return forbidden();
+  if (!auth.isAdmin) {
+    if (currentMeta?.ownerClientId) {
+      if (!clientId || clientId !== currentMeta.ownerClientId)
+        return forbidden();
+    } else if (currentMeta?.ownerKeyId) {
+      if (!auth.keyId || auth.keyId !== currentMeta.ownerKeyId)
+        return forbidden();
+    }
   }
 
   const version = Date.now();
   const base = r2Base(tenant, slug, version);
   const ownerKeyId =
     currentMeta?.ownerKeyId ?? (auth.isAdmin ? undefined : auth.keyId);
+  const ownerClientId =
+    currentMeta?.ownerClientId ??
+    (auth.isAdmin ? undefined : clientId || undefined);
 
   for (const f of files) {
     const p = sanitizeSlug(f.path);
@@ -763,9 +868,12 @@ async function handleServe(env: Env, req: Request) {
     }
     const ct = sanitizeContentType(f.contentType, p);
     try {
+      const customMeta: Record<string, string> = {};
+      if (ownerKeyId) customMeta.ownerKeyId = ownerKeyId;
+      if (ownerClientId) customMeta.ownerClientId = ownerClientId;
       await env.PAGES_BUCKET.put(base + p, content, {
         httpMetadata: { contentType: ct },
-        customMetadata: ownerKeyId ? { ownerKeyId } : undefined,
+        customMetadata: Object.keys(customMeta).length ? customMeta : undefined,
       });
     } catch (err) {
       return json(
@@ -788,6 +896,7 @@ async function handleServe(env: Env, req: Request) {
     tenant,
     slug,
     ownerKeyId,
+    ownerClientId,
     deleteAfterSeconds: clampDeleteAfterSeconds(b?.deleteAfterSeconds),
     autoDeleteAt: computeAutoDeleteAt(
       version,
