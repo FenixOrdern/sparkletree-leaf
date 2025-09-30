@@ -7,7 +7,7 @@ compatibility_flags = ["nodejs_compat"]
 # After provisioning: wrangler kv namespace create pages_kv, wrangler r2 bucket create pages
 [[kv_namespaces]]
 binding = "PAGES_KV"
-id = "b5b4f0fa48794951b3f656e765470f8a"
+id = "f3bb65330d8f478cb78c357ebd83c52e"
 
 [[r2_buckets]]
 binding = "PAGES_BUCKET"

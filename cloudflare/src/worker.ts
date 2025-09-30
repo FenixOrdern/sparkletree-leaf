@@ -21,6 +21,8 @@ type PageMeta = {
   tenant: string;
   slug: string;
   ownerKeyId?: string;
+  deleteAfterSeconds?: number;
+  autoDeleteAt?: string;
 };
 
 // ---------- helpers ----------
@@ -253,8 +255,44 @@ function sanitizeContentType(input: string | undefined, path: string): string {
 function kvKey(tenant: string, slug: string) {
   return `pages:${tenant}:${slug}`;
 }
+
 function r2Base(tenant: string, slug: string, version: number) {
   return `pages/${tenant}/${slug}/${version}/`;
+}
+
+// Auto-delete configuration
+const MIN_DELETE_AFTER = 10 * 60; // 10 minutes
+const MAX_DELETE_AFTER = 90 * 24 * 60 * 60; // 90 days
+const DEFAULT_DELETE_AFTER = 24 * 60 * 60; // 24 hours
+
+function clampDeleteAfterSeconds(val: any): number {
+  const n = Number(val);
+  if (!Number.isFinite(n)) return DEFAULT_DELETE_AFTER;
+  return Math.max(MIN_DELETE_AFTER, Math.min(MAX_DELETE_AFTER, Math.floor(n)));
+}
+
+function computeAutoDeleteAt(version: number, seconds: number): string {
+  return new Date(version + seconds * 1000).toISOString();
+}
+
+function isPageExpired(meta: PageMeta | null | undefined): boolean {
+  if (!meta?.autoDeleteAt) return false;
+  const at = Date.parse(meta.autoDeleteAt);
+  if (!Number.isFinite(at)) return false;
+  return Date.now() >= at;
+}
+
+async function deleteAllVersions(env: Env, tenant: string, slug: string) {
+  const prefix = `pages/${tenant}/${slug}/`;
+  let cursor: string | undefined = undefined;
+  do {
+    const list = await env.PAGES_BUCKET.list({ prefix, cursor });
+    if (list.objects.length) {
+      await env.PAGES_BUCKET.delete(list.objects.map((o) => o.key));
+    }
+    cursor = list.cursor;
+  } while (cursor);
+  await env.PAGES_KV.delete(kvKey(tenant, slug));
 }
 
 // ---------- API: POST /api/create ----------
@@ -320,6 +358,7 @@ async function handleCreate(env: Env, req: Request) {
     typeof b?.contentType === "string" ? b.contentType : undefined;
   const contentType = sanitizeContentType(contentTypeRaw, "index.html");
   const ttl = typeof b?.htmlTTL === "number" ? b.htmlTTL : 60;
+  const deleteAfterSeconds = clampDeleteAfterSeconds(b?.deleteAfterSeconds);
   if (!tenant || (!html && !htmlBase64))
     return json({ error: "tenant and (html|htmlBase64) required" }, 400);
 
@@ -402,6 +441,8 @@ async function handleCreate(env: Env, req: Request) {
     tenant,
     slug,
     ownerKeyId,
+    deleteAfterSeconds,
+    autoDeleteAt: computeAutoDeleteAt(version, deleteAfterSeconds),
   };
   await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(meta));
   return json({
@@ -426,6 +467,15 @@ async function handleServe(env: Env, req: Request) {
       return json({ error: "tenant and slug are required" }, 400);
     const authErr = await requireHmac(env, req);
     if (authErr) return authErr;
+    // Exclude expired pages and lazily clean up if expired
+    const currMetaRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
+    if (currMetaRaw) {
+      const currMeta: PageMeta = JSON.parse(currMetaRaw);
+      if (isPageExpired(currMeta)) {
+        await deleteAllVersions(env, tenant, slug);
+        return json({ ok: true, tenant, slug, versions: [] });
+      }
+    }
     // List versions by scanning R2 with prefix
     const prefix = `pages/${tenant}/${slug}/`;
     const vers: Array<{ version: number; objectKey: string }> = [];
@@ -489,6 +539,10 @@ async function handleServe(env: Env, req: Request) {
     const currMeta: PageMeta = currMetaRaw
       ? JSON.parse(currMetaRaw)
       : ({} as any);
+    if (isPageExpired(currMeta)) {
+      await deleteAllVersions(env, tenant, slug);
+      return json({ error: "Gone" }, 410);
+    }
     // Enforce ownership
     if (currMeta?.ownerKeyId && !auth.isAdmin) {
       if (!auth.keyId || auth.keyId !== currMeta.ownerKeyId) return forbidden();
@@ -734,6 +788,11 @@ async function handleServe(env: Env, req: Request) {
     tenant,
     slug,
     ownerKeyId,
+    deleteAfterSeconds: clampDeleteAfterSeconds(b?.deleteAfterSeconds),
+    autoDeleteAt: computeAutoDeleteAt(
+      version,
+      clampDeleteAfterSeconds(b?.deleteAfterSeconds),
+    ),
   };
   await env.PAGES_KV.put(kvKey(tenant, slug), JSON.stringify(meta));
   return json({
@@ -755,6 +814,10 @@ async function handleContent(env: Env, req: Request) {
   const currRaw = await env.PAGES_KV.get(kvKey(t, s));
   if (!currRaw) return json({ error: "Not found" }, 404);
   const currMeta: PageMeta = JSON.parse(currRaw);
+  if (isPageExpired(currMeta)) {
+    await deleteAllVersions(env, t, s);
+    return json({ error: "Gone" }, 410);
+  }
   const meta = version
     ? {
         ...currMeta,
@@ -849,6 +912,12 @@ async function handleRuntime(
   }
 
   if (!meta) return new Response("Not Found", { status: 404 });
+  if (isPageExpired(meta)) {
+    await deleteAllVersions(env, meta.tenant, meta.slug);
+    const headers = new Headers();
+    applySecurityHeaders(headers, false);
+    return new Response("Gone", { status: 410, headers });
+  }
 
   async function r2GetCandidate(objectKey: string, path: string) {
     const key1 = objectKey + path;
