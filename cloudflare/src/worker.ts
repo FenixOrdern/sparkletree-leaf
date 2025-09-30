@@ -361,6 +361,9 @@ async function handleCreate(env: Env, req: Request) {
   const auth = await getAuthContext(env, req);
   if (auth instanceof Response) return auth;
 
+  const rl = await rateLimit(env, req, "create", 60, 60);
+  if (rl) return rl;
+
   const b = (await req.json().catch(() => null)) as any;
   const tenant = String(b?.tenant || "")
     .trim()
@@ -689,6 +692,16 @@ async function handleServe(env: Env, req: Request) {
         } else {
           return forbidden();
         }
+      }
+    } else if (!currMeta && !auth.isAdmin) {
+      if (version) {
+        const head = await env.PAGES_BUCKET.head(
+          r2Base(tenant, slug, version) + "index.html",
+        );
+        const r2Owner = (head?.customMetadata as any)?.ownerKeyId;
+        if (!r2Owner || r2Owner !== auth.keyId) return forbidden();
+      } else {
+        return forbidden();
       }
     }
 
@@ -1080,6 +1093,72 @@ async function handleRuntime(
   return new Response(obj.body, { status: 200, headers });
 }
 
+// ---------- API: GET /api/list?tenant=...&cursor=...&limit=... ----------
+async function handleList(env: Env, req: Request) {
+  const url = new URL(req.url);
+  const tenant = String(url.searchParams.get("tenant") || "")
+    .trim()
+    .toLowerCase();
+  if (!tenant) return json({ error: "tenant is required" }, 400);
+
+  // Require HMAC for listing to keep data private
+  const authErr = await requireHmac(env, req);
+  if (authErr) return authErr;
+
+  const limitRaw = Number(url.searchParams.get("limit") || "50");
+  const limit =
+    Number.isFinite(limitRaw) && limitRaw > 0
+      ? Math.min(200, Math.max(1, Math.floor(limitRaw)))
+      : 50;
+  let cursor: string | undefined = url.searchParams.get("cursor") || undefined;
+
+  // Collect unique slugs under this tenant and track latest version seen
+  const prefix = `pages/${tenant}/`;
+  const latestBySlug = new Map<string, number>();
+
+  do {
+    const list = await env.PAGES_BUCKET.list({ prefix, cursor });
+    for (const obj of list.objects) {
+      // Expect keys like pages/{tenant}/{slug}/{version}/file...
+      const parts = obj.key.split("/");
+      if (parts.length >= 5) {
+        const slug = parts[2];
+        const v = Number(parts[3]);
+        if (!Number.isNaN(v)) {
+          const prev = latestBySlug.get(slug);
+          if (prev === undefined || v > prev) {
+            latestBySlug.set(slug, v);
+          }
+        }
+      }
+    }
+    cursor = list.cursor;
+    if (latestBySlug.size >= limit) break;
+  } while (cursor);
+
+  // Build response items, filter out expired pointers and lazily clean up
+  const items: Array<{ slug: string; latestVersion: number }> = [];
+  for (const [slug, latestVersion] of latestBySlug) {
+    const metaRaw = await env.PAGES_KV.get(kvKey(tenant, slug));
+    if (metaRaw) {
+      const meta: PageMeta = JSON.parse(metaRaw);
+      if (isPageExpired(meta)) {
+        await deleteAllVersions(env, tenant, slug);
+        continue;
+      }
+    }
+    items.push({ slug, latestVersion });
+    if (items.length >= limit) break;
+  }
+
+  return json({
+    ok: true,
+    tenant,
+    items,
+    nextCursor: cursor || null,
+  });
+}
+
 // ---------- Router ----------
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
@@ -1088,6 +1167,7 @@ export default {
     if (url.pathname === "/api/create" && req.method === "POST")
       return handleCreate(env, req);
     if (url.pathname.startsWith("/api/serve")) return handleServe(env, req);
+    if (url.pathname.startsWith("/api/list")) return handleList(env, req);
     if (url.pathname.startsWith("/api/content")) return handleContent(env, req);
 
     // Runtime: /p/{tenant}/[[...slug]]
