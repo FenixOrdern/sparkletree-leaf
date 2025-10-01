@@ -379,8 +379,8 @@ async function handleCreate(env: Env, req: Request) {
     `rp:${clientId || auth.keyId || "unknown"}:${jti}`,
   );
   if (pr) return pr;
-  const rl = await rateLimit(env, req, `create:${tenant}`, 60, 60);
-  if (rl) return rl;
+  const rlTenant = await rateLimit(env, req, `create:${tenant}`, 60, 60);
+  if (rlTenant) return rlTenant;
   const html = typeof b?.html === "string" ? b.html : null;
   const htmlBase64 = typeof b?.htmlBase64 === "string" ? b.htmlBase64 : null;
   const contentTypeRaw =
