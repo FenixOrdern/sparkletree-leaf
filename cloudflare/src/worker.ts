@@ -197,9 +197,12 @@ function applySecurityHeaders(h: Headers, isHtml = false) {
   // CSP: default to a permissive policy to allow generated content.
   // You can tighten this later or make it per-tenant configurable.
   const csp = isHtml
-    ? "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline' blob:; img-src * data: blob:; font-src 'self' data:; connect-src *; frame-ancestors 'none'; base-uri 'self'; object-src 'none'"
+    ? "default-src 'self' data: blob:; script-src 'self' 'unsafe-inline' 'unsafe-eval' blob:; style-src 'self' 'unsafe-inline' blob:; img-src * data: blob:; font-src 'self' data:; connect-src *; frame-ancestors 'self' https://probably.chat https://www.probably.chat https://*.probably.chat; base-uri 'self'; object-src 'none'"
     : "default-src 'none'; frame-ancestors 'none'; base-uri 'self'; object-src 'none'";
   h.set("content-security-policy", csp);
+  if (isHtml) {
+    h.set("x-frame-options", "ALLOW-FROM https://probably.chat");
+  }
 }
 
 function json(obj: any, status = 200, cacheControl?: string): Response {
